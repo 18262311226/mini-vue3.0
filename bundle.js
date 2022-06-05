@@ -1,5 +1,225 @@
 'use strict';
 
+let activeEffect = null; //当前要执行的副作用函数
+let effectStack = []; //存放副作用函数栈
+
+//副作用函数
+function effect(fn, options){
+    let effectfn = function (){
+        cleanup(effectfn);
+        activeEffect = effectfn;
+        effectStack.push(effectfn);
+        const res = fn(); //执行回调
+        effectStack.pop(); //当前副作用函数执行操作完成，将栈顶元素删除
+        activeEffect = effectStack[effectStack.length - 1]; //将栈顶的副作用函数设为当前
+        return res //返回副作用函数执行结果，方便computed，watch使用
+    };
+    effectfn.options = options;
+    effectfn.deps = [];
+    if(!options.lazy){ //是否延迟执行
+        effectfn();
+    }
+    return effectfn //返回effectfn，方便手动执行
+}
+
+//清空对应得副作用函数
+function cleanup(effectfn){
+    for(let i = 0;i<effectfn.deps.length;i++){
+        let deps = effectfn.deps[i];
+        deps.delete(effectfn);
+    }
+    effectfn.deps.length = 0;
+}
+
+//副作用函数桶
+let bucket = new WeakMap();
+
+//用于收集对于属性的副作用函数
+function track(target,key){
+    if(!activeEffect){ //没有副作用函数则直接跳出
+        return
+    }
+    let depsMap = bucket.get(target); //取出对应的响应式对象
+    if(!depsMap){
+        bucket.set(target, depsMap = new Map()); //没有的话，则创建一个以target为key的map对象用来存储
+    }
+
+    let deps = depsMap.get(key); //获取以对象上key作为存储的set数据
+    if(!deps){
+        depsMap.set(key, deps = new Set()); //没有的话同样进行创建
+    }
+
+    deps.add(activeEffect); //将副作用函数存储到该set数据里
+    activeEffect.deps.push(deps); //同样该副作用函数也要添加这个set
+}
+
+
+//用于触发对应属性的副作用函数
+function trigger(target,key,type, value){
+    let depsMap = bucket.get(target);
+    if(!depsMap){
+        return
+    }
+    let effects = depsMap.get(key); //拿到所有副作用函数
+    let effectsToRun = new Set(); //用来存储所有要执行的副作用函数
+
+    effects && effects.forEach(effectfn => {
+        if(effectfn !== activeEffect){ //要执行的副作用函数和当前副作用函数不是同一个进行添加
+            effectsToRun.add(effectfn);
+        }
+    });
+
+    //是添加或者删除操作
+    if(type === 'ADD' || type === 'DELETE'){
+        let iterateEffects = depsMap.get(ITERATE_KEY); //拿到对应的副作用函数
+        iterateEffects && iterateEffects.forEach(effectfn => {
+            if(effectfn !== activeEffect){
+                effectsToRun.add(effectfn);
+            }
+        });
+    }
+
+    //拿到对数组length进行操作的
+    if(type === 'ADD' && Array.isArray(target)){
+        let lengthEffects = depsMap.get('length');
+        lengthEffects && lengthEffects.forEach(effectfn => {
+            if(effectfn !== activeEffect){
+                effectsToRun.add(effectfn);
+            }
+        });
+    }
+
+    //拿到对数组下标或长度进行操作的
+    if(Array.isArray(target) && key === 'length'){
+        depsMap.forEach((effects,key)=>{
+            if(key <= value){
+                effects.forEac(effectfn => {
+                    if(effectfn !== activeEffect){
+                        effectsToRun.add(effectfn);
+                    }
+                });
+            }
+        });
+    }
+    
+    //将副作用函数依次执行
+    effectsToRun.forEach(effectfn => {
+        if(effectfn.options.scheduler){
+            effectfn.options.scheduler(effectfn);
+        }else {
+            effectfn();
+        }
+    });
+}
+
+let proxys = new Set();
+const ITERATE_KEY = Symbol();
+
+//创建响应式数据
+function createReactive(obj, isShallow = false, isReadyonly = false){
+    //判断是否式对象且不为null
+    if(obj == null || typeof obj !== 'object'){
+        throw new Error('is not a Object')
+    }
+
+    //判断该对象是否已经是响应式数据
+    if(proxys.has(obj)){
+        return
+    }
+
+    //创建代理对象
+    let proxy = new Proxy(obj, {
+        get(target,key){
+            if(key === 'raw'){
+                return target
+            }
+
+            //不是只读数据，则收集副作用函数
+            if(!isReadyonly){
+                track(target,key, receiver); 
+            }
+
+            const res = Reflect.get(target, key, receiver);
+
+            //是浅响应式数据则直接返回该数据，不做处理
+            if(isShallow){
+                return res
+            }
+
+            if(typeof res === 'object' && res !== null){//如果是该数据还是对象，则对他进行处理
+                return isReadyonly ? readonly(res) : reactive(res) //判断舒服只读，如果是则将它转换为只读数据 不是则继续递归转换为响应式
+            }
+
+            return res
+        },
+        set(target,key,value,receiver){            //只读属性则直接给警告，程序不向下执行
+            if(isReadyonly){
+                console.warn(`属性 ${key} 是只读的`);
+                return true
+            }
+
+            //判断数据是否为数组，如果是则判断下标是否小于数组长度，小于则是设置，反之添加， 不是数组，就当对象处理，判断key存不存在，不存在则是添加，反之就是设置
+            const type = Array.isArray(target) ? Number(key) < target.length  ? 'SET' : 'ADD' : Object.hasOwnProperty.call(target, key) ? 'SET' : 'ADD';
+            let oldVal = target[key]; //拿到老值
+
+            const res = Reflect.set(target, key, value, receiver);
+
+            if(target === receiver.key){
+                //值不相同才进行触发副作用函数
+                if(oldVal !== value && (oldVal === oldVal || value === value)){
+                    trigger(target,key,type,value);
+                }
+            }
+            
+            return res
+        },
+        deleteProperty(target, key){
+            //判断属性是否存在
+            const hasKey = Object.hasOwnProperty.call(target, key);
+
+            if(isReadyonly){
+                console.warn(`属性 ${key} 是只读的`);
+                return true
+            }
+
+            const res =  Reflect.deleteProperty(target, key); //删除属性
+
+            if(hasKey && res){//属性存在且删除成功才触发副作用函数
+                trigger(target, key, 'DELETE');
+            }
+
+            return res
+        },
+        has(target,key){//对 in 操作符进行监听
+            track(target,key);
+            return Reflect.has(target,key)
+        },
+        ownKeys(target){ //for in 操作进行监听
+            track(target, ITERATE_KEY);
+            return Reflect.ownKeys(target)
+        }
+    });
+
+    proxys.add(proxy); //添加到set中，方便进行判断数据是否已是响应式数据
+
+    return proxy //返回代理对象
+}
+
+//创建深响应式数据
+function reactive(obj){
+    return createReactive(obj)
+}
+
+//创建浅响应式数据
+function shallowReactive(obj){
+    return createReactive(obj, true)
+}
+
+//创建只读响应式数据
+function readonly(obj){
+    return createReactive(obj, false, true)
+}
+
 const Text = Symbol(); //文本节点
 const Fragment = Symbol();
 
@@ -28,6 +248,164 @@ function normalizeClass(data){
         }
     }
     return str
+}
+
+const queue = new Set();
+let isFlushing = false;
+const p = Promise.resolve();
+
+function QueueJob(job){
+    queue.add(job);
+    if(!isFlushing){
+        isFlushing = true;
+        p.then(() => {
+            try{
+                queue.forEach(job => job());
+            }finally{
+                isFlushing = true;
+                queue.length = 0;
+            }
+        });
+    }
+}
+
+function resolveProps(options, propsData){
+    const props = {};
+    const attrs = {};
+
+    for(let key in propsData){
+        if(key in options){
+            props[key] = propsData[key];
+        }else {
+            attrs[key] = propsData[key];
+        }
+    }
+
+    return [props, attrs]
+}
+
+function mountComponent(vnode, container, anchor){
+    const componentOptions = vnode.type;
+    const {render, data, setup, props: propsOption, beforeCreate, created, beforeMount, mounted, beforeUpdate, updated} = componentOptions;
+
+    beforeCreate && beforeCreate();
+
+    const state = data ? reactive(data()) : null;
+    const [props, attrs] = resolveProps(propsOption, vnode.props);
+
+    const instance = {
+        state,
+        props: shallowReactive(props),
+        isMounted: false,
+        subTree: null
+    };
+
+    function emit(event, ...payload){
+
+    }
+
+    const setupContext = { attrs, emit };
+    const setupResult = setup(shallowReactive(props), setupContext);
+    let setupState = null;
+
+    if(typeof setupResult === 'function'){
+        if(render){
+            console.error('setup返回渲染函数，render选项将被忽略');
+        }
+
+        render = setupResult;
+    }else {
+        setupState = setupContext;
+    }
+
+    vnode.component = instance;
+
+    const renderContext = new Proxy(instance, {
+        get(t, k, r){
+            const {state, props} = t;
+            if(state && k in state){
+                return state[k]
+            }else if(k in props){
+                return props[k]
+            }else if(setupState && k in setupState){
+                return setupState[k]
+            }else {
+                console.error('不存在');
+            }
+        },
+        set(t, k, v, r){
+            const {state, props} = t;
+            if(state && k in state){
+                state[k] = v;
+            }else if(k in props){
+                props[k] = v;
+            }else if(setupState && k in setupState){
+                setupState[k] = v;
+            }else {
+                console.error('不存在');
+            }
+        }
+    });
+
+    created && created.call(renderContext);
+
+    effect(()=>{
+        const subTree = render.call(state, state);
+        if(!instance.isMounted){
+            beforeMount && beforeMount.call(renderContext);
+
+            patch(null, subTree, container, anchor);
+
+            instance.isMounted = true;
+            mounted && mounted.call(renderContext);
+        }else {
+            beforeUpdate && beforeUpdate.call(renderContext);
+
+            patch(instance.subTree, subTree, container, anchor);
+
+            updated && updated.call(renderContext);
+        }
+        instance.subTree = subTree;
+    },{
+        scheduler: QueueJob
+    });
+}
+
+function hasPropsChange(prevProps, nextProps){
+    const nextKey = Object.keys(nextProps);
+
+    if(nextKey.length !== Object.keys(prevProps).length){
+        return true
+    }
+
+    for(let i = 0;i < nextKey.length;i++){
+        const key = nextKey[i];
+        if(nextProps[key] !== prevProps[key]){
+            return true
+        }
+    }
+
+    return false
+}
+
+function patchComponent(n1, n2, anchor){
+    const instance = (n2.component = n1.component);
+
+    const {props} = instance;
+
+    if(hasPropsChange(n1.props, n2.props)){
+        const [nextProps] = resolveProps(n2.type.props, n2.props);
+
+        for(let k in nextProps){
+            props[k] = nextProps[k];
+        }
+
+        for(let k in props){
+            if(!(k in nextProps)){
+                delete props[k];
+            }
+        }
+    }
 }
 
 function createRender(){
@@ -60,7 +438,13 @@ function createRender(){
             }else {
                 patchChildren(n1, n2, container);
             }
-        }else ;
+        }else if(typeof type === 'object'){
+            if(!n1){
+                mountComponent(n2, container, anchor);
+            }else {
+                patchComponent(n1, n2);
+            }
+        }else;
         
     }
 
