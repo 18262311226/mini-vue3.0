@@ -119,5 +119,3 @@ function parse (template) {
 
     return nodes
 }
-
-console.log(parse(`absc<a></a>`))
