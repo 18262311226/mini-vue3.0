@@ -319,6 +319,8 @@ export function createRender(){
             }else if(invoker){
                 el.removeEventListener(name, invoker)
             }
+        }else if(key === 'style'){
+            //todo
         }else if(key === 'class'){
             el.className = nextValue || ''
         }else if(shouldSetAsProps(el,key,nextValue)){
