@@ -204,6 +204,7 @@ function parseTag (context) {
         tag,
         isSelfClosing,
         children: [],
+        props,
         loc: getSelection(context, start)
     }
 }
@@ -241,8 +242,14 @@ function parseChildren (context) {
         nodes.push(node)
         break
     }
-
-    return nodes
+    nodes.forEach(node => {
+        if (node.type === NodeType.TEXT) {
+            if (node.content == null) {
+                node.content = null
+            }
+        }
+    })
+    return nodes.filter(Boolean)
 }
 
 function parse (template) {
